@@ -69,6 +69,36 @@ def _read_timeline_text(path: Path) -> str:
     raise last_error
 
 
+def _vp9_crf_for_quality(quality: int) -> int:
+    # VP9 CRF values go from 0 (best quality) to 63 (worst quality). We want to
+    # approximate the user-friendly imageio 1-10 quality scale to CRF.
+    # If CRF is not explicitly passed, then it will always use CRF 32, effectively
+    # removing the quality input.
+    quality = max(1, min(10, quality))
+    return 40 - ((quality - 1) * 20 // 9)
+
+
+def _writer_kwargs_for_extension(
+    file_path: Path, *, fps: int, quality: int
+) -> dict[str, int | str | list[str] | None]:
+    kwargs: dict[str, int | str | list[str] | None] = {
+        'fps': fps,
+        'quality': quality,
+    }
+    if file_path.suffix == '.webm':
+        kwargs.update(
+            codec='libvpx-vp9',
+            quality=None,
+            output_params=[
+                '-crf',
+                str(_vp9_crf_for_quality(quality)),
+                '-b:v',
+                '0',
+            ],
+        )
+    return kwargs
+
+
 class AnimationTimelineWidget(QWidget):
     def __init__(self, viewer: napari.viewer.ViewerModel):
         self.viewer = viewer
@@ -282,8 +312,9 @@ class AnimationTimelineWidget(QWidget):
                 ]:
                     writer = imageio.get_writer(
                         filename,
-                        fps=fps,
-                        quality=quality,
+                        **_writer_kwargs_for_extension(
+                            file_path, fps=fps, quality=quality
+                        ),
                     )
                 else:
                     writer = imageio.get_writer(
