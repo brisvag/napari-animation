@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import locale
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -45,6 +46,57 @@ _LAYER_TRACK_OPTIONS = {
     '{layer_name}transform': '_transforms',
     '{layer_name}clipping planes': 'experimental_clipping_planes',
 }
+
+
+def _format_layer_track_name(name_template: str, layer_name: str) -> str:
+    return name_template.format(layer_name=f'{layer_name}{EM_DASH}')
+
+
+def _read_timeline_text(path: Path) -> str:
+    encodings = ['utf-8', locale.getpreferredencoding(False), 'cp1252']
+    attempted = set()
+    last_error: UnicodeDecodeError | None = None
+    for encoding in encodings:
+        if not encoding or encoding in attempted:
+            continue
+        attempted.add(encoding)
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError as error:
+            last_error = error
+
+    assert last_error is not None
+    raise last_error
+
+
+def _vp9_crf_for_quality(quality: int) -> int:
+    # VP9 CRF values go from 0 (best quality) to 63 (worst quality). We want to
+    # approximate the user-friendly imageio 1-10 quality scale to CRF.
+    # If CRF is not explicitly passed, then it will always use CRF 32, effectively
+    # removing the quality input.
+    quality = max(1, min(10, quality))
+    return 40 - ((quality - 1) * 20 // 9)
+
+
+def _writer_kwargs_for_extension(
+    file_path: Path, *, fps: int, quality: int
+) -> dict[str, int | str | list[str] | None]:
+    kwargs: dict[str, int | str | list[str] | None] = {
+        'fps': fps,
+        'quality': quality,
+    }
+    if file_path.suffix == '.webm':
+        kwargs.update(
+            codec='libvpx-vp9',
+            quality=None,
+            output_params=[
+                '-crf',
+                str(_vp9_crf_for_quality(quality)),
+                '-b:v',
+                '0',
+            ],
+        )
+    return kwargs
 
 
 class AnimationTimelineWidget(QWidget):
@@ -98,6 +150,7 @@ class AnimationTimelineWidget(QWidget):
         self.save_btn.pressed.connect(self._save_dialogue)
         self.fps_spinbox.valueChanged.connect(self._update_fps)
 
+        self._update_layer_options()
         self.fps_spinbox.setValue(30)
 
     def _update_layer_options(self):
@@ -105,7 +158,7 @@ class AnimationTimelineWidget(QWidget):
             if layer in self.layer_track_options:
                 continue
             self.layer_track_options[layer] = {
-                name.format(layer_name=layer.name + EM_DASH): (
+                _format_layer_track_name(name, layer.name): (
                     layer,
                     attr_path,
                 )
@@ -142,7 +195,7 @@ class AnimationTimelineWidget(QWidget):
             _LAYER_TRACK_OPTIONS,
             strict=True,
         ):
-            new_name = name_template.format(layer_name=layer.name)
+            new_name = _format_layer_track_name(name_template, layer.name)
             self.timeline.animation.rename_track(old_name, new_name)
             new_opts[new_name] = old_val
 
@@ -237,6 +290,7 @@ class AnimationTimelineWidget(QWidget):
         self._filename = file_path
 
         save_as_folder = False
+        writer = None
         if file_path.suffix == '':
             save_as_folder = True
 
@@ -253,12 +307,14 @@ class AnimationTimelineWidget(QWidget):
                     '.mpeg',
                     '.mp4',
                     '.mkv',
+                    '.webm',
                     '.wmv',
                 ]:
                     writer = imageio.get_writer(
                         filename,
-                        fps=fps,
-                        quality=quality,
+                        **_writer_kwargs_for_extension(
+                            file_path, fps=fps, quality=quality
+                        ),
                     )
                 else:
                     writer = imageio.get_writer(
@@ -286,15 +342,23 @@ class AnimationTimelineWidget(QWidget):
             frame_iterator, desc='Rendering animation...', total=anim.n_frames
         ):
             image = self.viewer.screenshot(
-                canvas_only=canvas_only, scale=scale_factor, flash=False
+                canvas_only=canvas_only,
+                scale=scale_factor if canvas_only else None,
+                flash=False,
             )
             frames.append(image)
 
         if mode == PlayMode.PINGPONG:
             frames = frames + frames[::-1]
 
-        for frame in frames:
-            writer.append_data(frame)
+        for index, frame in enumerate(frames):
+            if writer is None:
+                imageio.imwrite(folder_path / f'{index:05d}.png', frame)
+            else:
+                writer.append_data(frame)
+
+        if writer is not None:
+            writer.close()
 
         anim.play_mode = mode
 
@@ -302,15 +366,25 @@ class AnimationTimelineWidget(QWidget):
         """Save timeline to a json file given a filename."""
         dump = self.timeline.animation.model_dump_json(indent=4)
         path = Path(filename)
-        with open(path, 'w') as f:
-            f.write(dump)
+        path.write_text(dump, encoding='utf-8')
 
     def load_timeline(self, filename):
         """Load a timeline from a json file given a filename."""
-        with open(filename) as f:
-            validated = self.timeline.animation.model_validate_json(f.read())
-        for k, v in validated.model_dump().items():
+        path = Path(filename)
+        validated = self.timeline.animation.model_validate_json(
+            _read_timeline_text(path)
+        )
+        dump = validated.model_dump()
+        current_frame = dump.pop('current_frame')
+        dump.pop('track_options', None)
+        for k, v in dump.items():
             setattr(self.timeline.animation, k, v)
 
         self._update_track_options()
+        self.timeline.animation.current_frame = current_frame
+        self.fps_spinbox.setMaximum(
+            max(self.fps_spinbox.maximum(), self.timeline.animation.play_fps)
+        )
+        self.fps_spinbox.setValue(self.timeline.animation.play_fps)
+        self._update_duration()
         self.timeline._update_geometry()
